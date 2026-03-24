@@ -1,0 +1,53 @@
+-- §3.2 Inter-Step Gap 분포 (Trino)
+-- 목적: STEP_INACTIVITY_TIMEOUT_MS = 5분 설정의 타당성 검증
+-- 정의: 하나의 웨이퍼 run 내에서 이전 step의 MAX(ts) → 다음 step의 MIN(ts) 간격
+
+WITH step_boundary AS (
+    -- 1단계: 웨이퍼 run 내 step별 시작/종료 시각
+    SELECT
+        eqp_id, module_name, lot_id, slot_id, recipe_id, start_dtts,
+        step_id,
+        MIN(ts) AS step_start_ts,
+        MAX(ts) AS step_end_ts
+    FROM fdc.fdc_trace
+    WHERE fab = '{FAB}'
+      AND dt BETWEEN '{START}' AND '{END}'
+    GROUP BY eqp_id, module_name, lot_id, slot_id, recipe_id, start_dtts, step_id
+),
+step_ordered AS (
+    -- 2단계: 웨이퍼 run 내에서 step을 시작 시각 순으로 정렬, 다음 step의 시작 시각 가져오기
+    SELECT
+        *,
+        LEAD(step_start_ts) OVER (
+            PARTITION BY eqp_id, module_name, lot_id, slot_id, recipe_id, start_dtts
+            ORDER BY step_start_ts
+        ) AS next_step_start_ts
+    FROM step_boundary
+),
+gap_calculated AS (
+    -- 3단계: gap 계산 (초 단위)
+    SELECT
+        *,
+        DATE_DIFF('second', step_end_ts, next_step_start_ts) AS gap_seconds
+    FROM step_ordered
+    WHERE next_step_start_ts IS NOT NULL  -- 마지막 step 제외
+)
+
+-- 4단계: 분포 확인
+SELECT
+    COUNT(*)                                   AS total_gaps,
+    APPROX_PERCENTILE(gap_seconds, 0.50)       AS p50_sec,
+    APPROX_PERCENTILE(gap_seconds, 0.75)       AS p75_sec,
+    APPROX_PERCENTILE(gap_seconds, 0.90)       AS p90_sec,
+    APPROX_PERCENTILE(gap_seconds, 0.95)       AS p95_sec,
+    APPROX_PERCENTILE(gap_seconds, 0.99)       AS p99_sec,
+    APPROX_PERCENTILE(gap_seconds, 0.999)      AS p999_sec,
+    MAX(gap_seconds)                           AS max_sec,
+    -- 5분(300초) 기준 위반율
+    COUNT_IF(gap_seconds > 0 AND gap_seconds <= 300)  AS normal_count,
+    COUNT_IF(gap_seconds > 300)                       AS exceed_5min_count,
+    ROUND(COUNT_IF(gap_seconds > 300) * 100.0 / COUNT(*), 4) AS exceed_5min_pct,
+    -- 음수 gap = step 시간 구간 겹침 (out-of-order 또는 동시 step)
+    COUNT_IF(gap_seconds < 0)                  AS overlap_count,
+    ROUND(COUNT_IF(gap_seconds < 0) * 100.0 / COUNT(*), 4) AS overlap_pct
+FROM gap_calculated;
