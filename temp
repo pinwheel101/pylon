@@ -1,0 +1,85 @@
+private def runMaintenance(spark: SparkSession, targetTable: String): Unit = {
+    LOG.info(s"=== Iceberg Maintenance: $targetTable ===")
+
+    LOG.info("[MAINTENANCE] rewrite_data_files ...")
+    spark.sql(
+      s"""CALL ${targetTable.split('.')(0)}.system.rewrite_data_files(
+         |  table => '$targetTable',
+         |  options => map('target-file-size-bytes', '536870912')
+         |)""".stripMargin
+    )
+    LOG.info("[MAINTENANCE] rewrite_data_files done")
+
+    LOG.info("[MAINTENANCE] expire_snapshots ...")
+    spark.sql(
+      s"""CALL ${targetTable.split('.')(0)}.system.expire_snapshots(
+         |  table => '$targetTable',
+         |  retain_last => 1
+         |)""".stripMargin
+    )
+    LOG.info("[MAINTENANCE] expire_snapshots done")
+
+    LOG.info("[MAINTENANCE] remove_orphan_files ...")
+    spark.sql(
+      s"""CALL ${targetTable.split('.')(0)}.system.remove_orphan_files(
+         |  table => '$targetTable'
+         |)""".stripMargin
+    )
+    LOG.info("[MAINTENANCE] remove_orphan_files done")
+
+    LOG.info("[MAINTENANCE] rewrite_manifests ...")
+    spark.sql(
+      s"""CALL ${targetTable.split('.')(0)}.system.rewrite_manifests(
+         |  table => '$targetTable'
+         |)""".stripMargin
+    )
+    LOG.info("[MAINTENANCE] rewrite_manifests done")
+  }
+
+  private def migrateSingleDay(
+      spark: SparkSession,
+      targetTable: String,
+      fab: String,
+      dt: String,
+      dryRun: Boolean
+  ): Long = {
+
+    // arrays_zip + posexplode: 모든 Array 컬럼의 인덱스 정합성을 자동 보장
+    val query =
+      s"""
+         |WITH source AS (
+         |    SELECT *
+         |    FROM $SOURCE_DB.fdc_summary_lot_iceberg
+         |    WHERE fab = '$fab'
+         |      AND dt = '$dt'
+         |),
+         |exploded AS (
+         |    SELECT
+         |        s.eid,
+         |        s.modname,
+         |        s.ltid,
+         |        s.sl_id
+         |
+         |    FROM source s
+         |    LATERAL VIEW POSEXPLODE(
+         |        arrays_zip(
+         |            s.param_name,
+         |            s.max_val,
+         |            s.min_val,
+         |            s.mean_val,
+         |            s.start_time
+         |        )
+         |    ) t AS pos, col
+         |)
+         |SELECT
+         |    0                                  AS step_instance,
+         |    param_name, 
+         |
+         |    CAST(etl_start_dtts AS TIMESTAMP)  AS etl_start_dtts,
+         |    CAST(etl_end_dtts AS TIMESTAMP)    AS etl_end_dtts
+         |
+         |FROM exploded
+       """.stripMargin
+
+  }
+}
