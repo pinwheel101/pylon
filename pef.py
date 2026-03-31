@@ -13,13 +13,6 @@ Setup:
   3. Edit CONFIG section (host, port, data scope)
   4. python perf-benchmark.py [--dry-run] [--rounds N]
 
-schema_mapping.json format:
-  {
-    "tables": { "t_arr": "catalog.schema.array_table", "t_flat": "catalog.schema.flat_table" },
-    "columns": { "c_f1": "real_col", "c_f2": "real_col", ... }
-  }
-  See SCHEMA_KEYS dict for all required column keys.
-
 Output:
   benchmark_output/benchmark_results.json
   benchmark_output/benchmark_report.md
@@ -155,18 +148,22 @@ def load_schema_mapping() -> Dict[str, str]:
 class RunStats:
     wall_time_ms: float = 0.0
     cpu_time_ms: float = 0.0
-    processed_rows: int = 0
-    processed_bytes: int = 0
+    physical_input_rows: int = 0
+    physical_input_bytes: int = 0
+    peak_memory_bytes: int = 0
     result_rows: int = 0
+    query_id: str = ""
     error: str = ""
 
     def to_dict(self):
         d = {
             "wall_time_ms": round(self.wall_time_ms, 1),
             "cpu_time_ms": round(self.cpu_time_ms, 1),
-            "processed_rows": self.processed_rows,
-            "processed_bytes": self.processed_bytes,
+            "physical_input_rows": self.physical_input_rows,
+            "physical_input_bytes": self.physical_input_bytes,
+            "peak_memory_bytes": self.peak_memory_bytes,
             "result_rows": self.result_rows,
+            "query_id": self.query_id,
         }
         if self.error:
             d["error"] = self.error
@@ -201,20 +198,105 @@ def get_connection():
     return connect(**kwargs)
 
 
+def _parse_duration_ms(duration_str) -> float:
+    """Parse Trino duration (e.g. '1.23s', '456.78ms', '2.00m') to ms."""
+    if not duration_str:
+        return 0.0
+    s = str(duration_str).strip()
+    try:
+        if s.endswith("ms"):
+            return float(s[:-2])
+        elif s.endswith("s"):
+            return float(s[:-1]) * 1000
+        elif s.endswith("m"):
+            return float(s[:-1]) * 60000
+        elif s.endswith("h"):
+            return float(s[:-1]) * 3600000
+        elif s.endswith("ns"):
+            return float(s[:-2]) / 1_000_000
+        elif s.endswith("us"):
+            return float(s[:-2]) / 1_000
+    except ValueError:
+        pass
+    return 0.0
+
+
+def _get_query_id(cursor) -> str:
+    """Extract query_id from cursor (trino-python-client internals)."""
+    # Try known attribute paths across client versions
+    for attr_path in [
+        lambda c: c._query.query_id,
+        lambda c: c._result.query_id,
+        lambda c: c.stats.get("queryId", ""),
+    ]:
+        try:
+            qid = attr_path(cursor)
+            if qid:
+                return str(qid)
+        except Exception:
+            pass
+    return ""
+
+
 def run_query(conn, sql: str) -> RunStats:
+    """Execute query, then fetch accurate stats from system.runtime.queries."""
     cursor = conn.cursor()
     t0 = time.monotonic()
     cursor.execute(sql.strip())
     rows = cursor.fetchall()
     wall_ms = (time.monotonic() - t0) * 1000.0
-    stats = getattr(cursor, "stats", None) or {}
-    return RunStats(
+
+    qid = _get_query_id(cursor)
+    result = RunStats(
         wall_time_ms=wall_ms,
-        cpu_time_ms=stats.get("cpuTimeMillis", 0),
-        processed_rows=stats.get("processedRows", 0),
-        processed_bytes=stats.get("processedBytes", 0),
         result_rows=len(rows),
+        query_id=qid,
     )
+
+    # Fetch accurate stats from Trino system table
+    if qid:
+        try:
+            sc = conn.cursor()
+            sc.execute(f"""
+                SELECT
+                    total_cpu_time,
+                    physical_input_bytes,
+                    physical_input_rows,
+                    peak_user_memory_reservations
+                FROM system.runtime.queries
+                WHERE query_id = '{qid}'
+            """)
+            row = sc.fetchone()
+            if row:
+                result.cpu_time_ms = _parse_duration_ms(row[0])
+                result.physical_input_bytes = row[1] or 0
+                result.physical_input_rows = row[2] or 0
+                result.peak_memory_bytes = row[3] or 0
+        except Exception:
+            # Fallback: try peak_memory_reservations (older Trino)
+            try:
+                sc2 = conn.cursor()
+                sc2.execute(f"""
+                    SELECT
+                        total_cpu_time,
+                        physical_input_bytes,
+                        physical_input_rows
+                    FROM system.runtime.queries
+                    WHERE query_id = '{qid}'
+                """)
+                row2 = sc2.fetchone()
+                if row2:
+                    result.cpu_time_ms = _parse_duration_ms(row2[0])
+                    result.physical_input_bytes = row2[1] or 0
+                    result.physical_input_rows = row2[2] or 0
+            except Exception:
+                # Last fallback: use cursor.stats
+                cs = getattr(cursor, "stats", None) or {}
+                result.cpu_time_ms = cs.get("cpuTimeMillis", 0)
+                result.physical_input_rows = cs.get("processedRows", 0)
+                result.physical_input_bytes = cs.get("processedBytes", 0)
+
+    return result
 
 
 def fetch_rows(conn, sql: str) -> list:
@@ -751,9 +833,11 @@ def run_benchmark(conn, queries: List[QueryBenchmark], dry_run: bool = False):
                         run_list.append(st)
                     print(f"  [{tag}] {label} | wall={st.wall_time_ms:>9,.0f}ms"
                           f" | cpu={st.cpu_time_ms:>9,.0f}ms"
-                          f" | rows={st.processed_rows:>12,}"
-                          f" | bytes={st.processed_bytes:>14,}"
-                          f" | result={st.result_rows}")
+                          f" | phys_rows={st.physical_input_rows:>12,}"
+                          f" | phys_bytes={st.physical_input_bytes:>14,}"
+                          f" | peak_mem={st.peak_memory_bytes:>14,}"
+                          f" | result={st.result_rows}"
+                          f" | qid={st.query_id}")
                 except Exception as e:
                     err = str(e)[:120]
                     print(f"  [{tag}] {label} | ERROR: {err}")
@@ -811,8 +895,8 @@ def generate_report(queries: List[QueryBenchmark], sample: Dict[str, Any]) -> st
         fw = _avg(q.flat_runs, "wall_time_ms")
         ac = _avg(q.array_runs, "cpu_time_ms")
         fc = _avg(q.flat_runs, "cpu_time_ms")
-        ab = _avg(q.array_runs, "processed_bytes")
-        fb = _avg(q.flat_runs, "processed_bytes")
+        ab = _avg(q.array_runs, "physical_input_bytes")
+        fb = _avg(q.flat_runs, "physical_input_bytes")
         speedup = aw / fw if fw > 0 else 0
 
         lines.append(
@@ -837,15 +921,17 @@ def generate_report(queries: List[QueryBenchmark], sample: Dict[str, Any]) -> st
             lines.append("_No results_\n")
             continue
 
-        lines.append("| Run | Type | Wall (ms) | CPU (ms) | Processed Rows | Processed Bytes | Result |")
-        lines.append("|----:|------|----------:|---------:|---------------:|----------------:|-------:|")
+        lines.append("| Run | Type | Wall (ms) | CPU (ms) | Phys Input Rows | Phys Input Bytes | Peak Mem | Result |")
+        lines.append("|----:|------|----------:|---------:|----------------:|-----------------:|---------:|-------:|")
 
         for i, r in enumerate(q.array_runs, 1):
             lines.append(f"| {i} | array | {r.wall_time_ms:,.0f} | {r.cpu_time_ms:,.0f} "
-                         f"| {r.processed_rows:,} | {r.processed_bytes:,} | {r.result_rows} |")
+                         f"| {r.physical_input_rows:,} | {r.physical_input_bytes:,} "
+                         f"| {r.peak_memory_bytes:,} | {r.result_rows} |")
         for i, r in enumerate(q.flat_runs, 1):
             lines.append(f"| {i} | flat | {r.wall_time_ms:,.0f} | {r.cpu_time_ms:,.0f} "
-                         f"| {r.processed_rows:,} | {r.processed_bytes:,} | {r.result_rows} |")
+                         f"| {r.physical_input_rows:,} | {r.physical_input_bytes:,} "
+                         f"| {r.peak_memory_bytes:,} | {r.result_rows} |")
 
         aw = _avg(q.array_runs, "wall_time_ms")
         fw = _avg(q.flat_runs, "wall_time_ms")
