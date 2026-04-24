@@ -1,0 +1,1 @@
+kubectl logs -n fdc-flink <last-run-name>-driver | grep -E 'Maintenance (start|end)|\[.*\] (starting|completed|failed)|result:|All maintenance steps'
