@@ -1,0 +1,110 @@
+# Iceberg 유지보수 1회성 대량 drain 잡 (Spark / Scala).
+#
+# 용도:
+#   - 최초 백로그 정리 (예: 현재 5,600개 스몰파일 → 수십개로 축소)
+#   - 운영 중 사고성 백로그 누적 해소
+#
+# 주기 실행은 `k8s/maintenance-spark.yaml`(ScheduledSparkApplication) 이 담당한다.
+# 이 잡은 **1회성**으로 리소스와 병렬도를 키워 빠르게 드레인한다.
+#
+# 적용:
+#   1. 이름이 같은 이전 잡이 남아있으면 먼저 정리:
+#        kubectl delete sparkapplication iceberg-maintenance-drain -n flink --ignore-not-found
+#   2. 실행:
+#        kubectl apply -f k8s/maintenance-spark-drain.yaml
+#   3. 완료 대기:
+#        kubectl get sparkapplication iceberg-maintenance-drain -n flink -w
+#   4. 완료 후 manifest 삭제 (재실행 방지):
+#        kubectl delete -f k8s/maintenance-spark-drain.yaml
+#
+# ServiceAccount / RBAC 는 `maintenance-spark.yaml` 에서 생성한
+# `spark-iceberg-maintenance` 를 재사용한다.
+
+---
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: iceberg-maintenance-drain
+  namespace: flink
+spec:
+  type: Scala
+  mode: cluster
+
+  image: your-registry.example.com/spark-iceberg:3.5.6-1.10.1
+  imagePullPolicy: IfNotPresent
+
+  mainApplicationFile: s3a://flink-artifacts/flink/iceberg-maintenance-spark.jar
+  mainClass: com.maintenance.spark.IcebergMaintenanceJob
+
+  sparkVersion: "3.5.6"
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 1                   # 대량 drain은 partial-progress로 복구되므로 재시도 최소화
+    onFailureRetryInterval: 120
+    onSubmissionFailureRetries: 3
+    onSubmissionFailureRetryInterval: 30
+
+  # ── 주기 잡과 동일한 Spark / Iceberg / S3 설정 ─────────
+  sparkConf:
+    "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+    "spark.sql.catalog.polaris": "org.apache.iceberg.spark.SparkCatalog"
+    "spark.sql.catalog.polaris.type": "rest"
+    "spark.sql.catalog.polaris.uri": "http://polaris.polaris.svc:8181/api/catalog"
+    "spark.sql.catalog.polaris.warehouse": "warehouse"
+    "spark.sql.catalog.polaris.io-impl": "org.apache.iceberg.aws.s3.S3FileIO"
+    "spark.hadoop.fs.s3a.endpoint": "http://minio.minio.svc:9000"
+    "spark.hadoop.fs.s3a.path.style.access": "true"
+    "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.auth.EnvironmentVariableCredentialsProvider"
+    "spark.sql.catalog.polaris.s3.endpoint": "http://minio.minio.svc:9000"
+    "spark.sql.catalog.polaris.s3.path-style-access": "true"
+    "spark.dynamicAllocation.enabled": "false"
+
+  # drain 전용: max-concurrent-file-group-rewrites 를 10으로 키워 빠르게 소화.
+  # partial-progress.enabled=true 는 Scala 잡이 기본으로 넣으므로 중간 실패해도 커밋된 부분은 보존된다.
+  arguments:
+    - "--iceberg.catalog"
+    - "polaris"
+    - "--maintenance.tables"
+    - "sum_flat"
+    - "--maintenance.target-file-size-bytes"
+    - "536870912"
+    - "--maintenance.min-file-size-bytes"
+    - "134217728"
+    - "--maintenance.snapshot-max-age-hours"
+    - "72"
+    - "--maintenance.snapshot-retain-last"
+    - "300"
+    - "--maintenance.max-concurrent-rewrites"
+    - "10"                                # 주기 잡의 5 → 10
+
+  driver:
+    cores: 2
+    memory: "3g"                          # SQL 파싱/결과 수집; 대량 파일 group 메타 처리
+    labels:
+      app: iceberg-maintenance-drain
+    serviceAccount: spark-iceberg-maintenance
+    env:
+      - name: AWS_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef: { name: flink-lake-secrets, key: s3-access-key }
+      - name: AWS_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef: { name: flink-lake-secrets, key: s3-secret-key }
+
+  # executor 4 → 8, max-concurrent 5 → 10 에 맞춰 병렬도 확보.
+  # 현재 5,600 스몰파일(avg 4.5MB, p50 17KB) 드레인에 S3 GET 레이턴시가 지배적이므로
+  # core 수보다 executor 개수(= 동시 TCP 커넥션)가 중요하다.
+  executor:
+    cores: 2
+    instances: 8                          # 4 → 8
+    memory: "6g"
+    labels:
+      app: iceberg-maintenance-drain
+    env:
+      - name: AWS_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef: { name: flink-lake-secrets, key: s3-access-key }
+      - name: AWS_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef: { name: flink-lake-secrets, key: s3-secret-key }
