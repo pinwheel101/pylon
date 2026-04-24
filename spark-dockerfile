@@ -1,0 +1,67 @@
+# Spark + Iceberg 런타임 이미지.
+#
+# 용도:
+#   Spark Operator 가 실행하는 IcebergMaintenanceJob / IcebergOrphanCleanupJob 의
+#   런타임 classpath 를 제공한다. 이 이미지에는 프로젝트 thin JAR 은 포함되지 않으며,
+#   thin JAR 은 MinIO(`s3a://fdc-artifacts/iceberg-maintenance-spark.jar`) 에서
+#   spark-submit 가 런타임에 다운로드한다.
+#
+# 포함 내용:
+#   - apache/spark:3.5.6 (Scala 2.12, Java 17 배포판)
+#   - iceberg-spark-runtime-3.5_2.12:1.10.1 → /opt/spark/jars/
+#   - iceberg-aws-bundle:1.10.1          → /opt/spark/jars/  (S3FileIO + AWS SDK v2)
+#
+# hadoop-aws / hadoop-common 은 apache/spark 베이스 이미지에 이미 포함.
+#
+# 빌드:
+#   docker build -f docker/Dockerfile \
+#     -t your-registry.example.com/spark-iceberg:3.5.6-1.10.1-scala2.12 .
+#
+# 푸시:
+#   docker push your-registry.example.com/spark-iceberg:3.5.6-1.10.1-scala2.12
+#
+# 로컬 검증 (JAR 존재 확인):
+#   docker run --rm --entrypoint ls \
+#     your-registry.example.com/spark-iceberg:3.5.6-1.10.1-scala2.12 \
+#     -l /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.10.1.jar \
+#        /opt/spark/jars/iceberg-aws-bundle-1.10.1.jar
+
+# ── Base ──────────────────────────────────────────────────────────────
+# apache/spark:3.5.6 기본 태그는 Scala 2.12 / Java 17 (Ubuntu). 필요 시
+# SPARK_BASE_TAG 를 override 해서 재빌드 (예: --build-arg SPARK_BASE_TAG=3.5.6-scala2.12-java17).
+# 재현성이 중요하면 digest 로 pin: apache/spark@sha256:...
+ARG SPARK_BASE_TAG=3.5.6
+FROM apache/spark:${SPARK_BASE_TAG}
+
+# ── Iceberg 버전 핀 ────────────────────────────────────────────────────
+# build.sbt 의 icebergVersion / scalaVersion 과 일치해야 한다.
+ARG ICEBERG_VERSION=1.10.1
+ARG SCALA_BINARY=2.12
+ARG SPARK_MINOR=3.5
+ARG MAVEN_BASE=https://repo1.maven.org/maven2
+
+# 베이스 이미지의 spark user(uid 185) 가 /opt/spark/jars/ 를 소유하지 않으므로
+# root 로 내려가 JAR 을 설치하고 마지막에 spark 로 복귀.
+USER root
+
+# ── Iceberg JAR 다운로드 + 무결성 검증 ────────────────────────────────
+# Maven Central 이 제공하는 .sha512 를 함께 받아 sha512sum -c 로 검증한다.
+# Central 의 .sha512 파일은 hash 문자열만 들어있으므로 "hash  filename" 형태로 변환해 체크.
+RUN set -eux; \
+    cd /opt/spark/jars; \
+    for artifact in \
+      "org/apache/iceberg/iceberg-spark-runtime-${SPARK_MINOR}_${SCALA_BINARY}/${ICEBERG_VERSION}/iceberg-spark-runtime-${SPARK_MINOR}_${SCALA_BINARY}-${ICEBERG_VERSION}.jar" \
+      "org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar" \
+    ; do \
+      fname="$(basename "$artifact")"; \
+      curl -fsSL --retry 3 --retry-delay 2 -o "$fname"         "${MAVEN_BASE}/${artifact}"; \
+      curl -fsSL --retry 3 --retry-delay 2 -o "$fname.sha512"  "${MAVEN_BASE}/${artifact}.sha512"; \
+      echo "$(cat "$fname.sha512")  $fname" | sha512sum -c -; \
+      rm -f "$fname.sha512"; \
+      chown spark:spark "$fname"; \
+      chmod 0644 "$fname"; \
+    done; \
+    ls -l /opt/spark/jars/iceberg-spark-runtime-${SPARK_MINOR}_${SCALA_BINARY}-${ICEBERG_VERSION}.jar \
+          /opt/spark/jars/iceberg-aws-bundle-${ICEBERG_VERSION}.jar
+
+USER spark
