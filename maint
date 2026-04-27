@@ -1,0 +1,212 @@
+package com.maintenance.spark
+
+import org.apache.spark.sql.SparkSession
+import org.slf4j.{Logger, LoggerFactory}
+
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.time.{Instant, ZoneOffset}
+
+/**
+ * Iceberg 테이블 유지보수 배치 잡 (Spark 3.5.x / Iceberg 1.10.x, Scala 2.12).
+ *
+ * 스트리밍 파이프라인이 체크포인트마다 생성하는 스몰 파일을 주기적으로 compaction 하고,
+ * 오래된 스냅샷과 메타데이터를 정리한다.
+ *
+ * 실행 순서:
+ *   1. ALTER TABLE ... SET TBLPROPERTIES (멱등)
+ *   2. CALL system.rewrite_data_files (binpack)
+ *   3. CALL system.expire_snapshots
+ *   4. CALL system.rewrite_manifests
+ *
+ * 카탈로그:
+ *   HMS(Hive Metastore) 기반 Iceberg 카탈로그를 가정한다. 데이터/메타데이터는 MinIO(S3) 에 저장.
+ *   카탈로그 설정은 spark-submit `--conf` 또는 SparkApplication.sparkConf 로 주입
+ *   ─ `k8s/maintenance-spark.yaml` 참고.
+ *   예시 카탈로그 이름: `hms`.
+ *
+ * 필수 파라미터:
+ *   --iceberg.catalog                       Iceberg catalog 이름 (예: hms)
+ *   --maintenance.tables                    대상 테이블 (쉼표 구분, 예: summary,summary_flat)
+ *
+ * 선택 파라미터 (기본값):
+ *   --maintenance.snapshot-max-age-hours       72          만료 기준 시간
+ *   --maintenance.snapshot-retain-last         100         최소 보존 스냅샷 수
+ *   --maintenance.target-file-size-bytes       536870912   binpack 목표 파일 크기 (512 MB)
+ *   --maintenance.min-file-size-bytes          134217728   이보다 작은 파일만 compaction 대상 (128 MB)
+ *   --maintenance.max-concurrent-rewrites      5           파일 그룹 동시 재작성 수
+ *   --maintenance.max-file-group-size-bytes    10737418240 한 task 가 sort/commit 하는 group 의 합산 크기 상한 (10 GB).
+ *                                                          Iceberg 기본값 100 GB 는 한 task 가 수 GB 를 sort 하면서
+ *                                                          spill/OOM 의 원인이 되므로 보수적으로 낮춘다.
+ *   --maintenance.partial-progress-max-commits 10          group 이 많아질수록 commit 배치도 키워야 진행이 막히지 않는다.
+ */
+object IcebergMaintenanceJob {
+
+  private val LOG: Logger = LoggerFactory.getLogger(getClass)
+
+  private val TS_FMT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC)
+
+  private val DefaultTargetFileSize: Long = 536870912L // 512 MB
+  private val DefaultMinFileSize: Long = 134217728L // 128 MB
+  private val DefaultSnapshotMaxAgeHours: Int = 72
+  private val DefaultSnapshotRetainLast: Int = 100
+  private val DefaultMaxConcurrentRewrites: Int = 5
+  // Iceberg 기본값(100 GB) 은 한 task 가 수 GB 를 sort → spill/OOM. 10 GB 로 낮춰 task 부담 균질화.
+  private val DefaultMaxFileGroupSize: Long = 10737418240L // 10 GB
+  private val DefaultPartialProgressMaxCommits: Int = 10
+
+  def main(args: Array[String]): Unit = {
+    val params = parseArgs(args)
+
+    val catalogName = require(params, "iceberg.catalog")
+    val tables = require(params, "maintenance.tables")
+
+    val targetFileSize = params
+      .getOrElse("maintenance.target-file-size-bytes", DefaultTargetFileSize.toString)
+      .toLong
+    val minFileSize = params
+      .getOrElse("maintenance.min-file-size-bytes", DefaultMinFileSize.toString)
+      .toLong
+    val snapshotMaxAgeHours = params
+      .getOrElse("maintenance.snapshot-max-age-hours", DefaultSnapshotMaxAgeHours.toString)
+      .toInt
+    val snapshotRetainLast = params
+      .getOrElse("maintenance.snapshot-retain-last", DefaultSnapshotRetainLast.toString)
+      .toInt
+    val maxConcurrentRewrites = params
+      .getOrElse("maintenance.max-concurrent-rewrites", DefaultMaxConcurrentRewrites.toString)
+      .toInt
+    val maxFileGroupSize = params
+      .getOrElse("maintenance.max-file-group-size-bytes", DefaultMaxFileGroupSize.toString)
+      .toLong
+    val partialProgressMaxCommits = params
+      .getOrElse("maintenance.partial-progress-max-commits", DefaultPartialProgressMaxCommits.toString)
+      .toInt
+
+    val spark = SparkSession.builder().appName("iceberg-maintenance").getOrCreate()
+
+    var hasFailure = false
+    try {
+      tables.split(",").iterator.map(_.trim).filter(_.nonEmpty).foreach { table =>
+        LOG.info(s"=== Maintenance start: `$catalogName`.$table ===")
+
+        hasFailure |= runStep("set-properties",
+          () => setTableProperties(spark, catalogName, table))
+        hasFailure |= runStep("rewrite-data-files",
+          () => rewriteDataFiles(spark, catalogName, table,
+            targetFileSize, minFileSize, maxConcurrentRewrites,
+            maxFileGroupSize, partialProgressMaxCommits))
+        hasFailure |= runStep("expire-snapshots",
+          () => expireSnapshots(spark, catalogName, table,
+            snapshotMaxAgeHours, snapshotRetainLast))
+        hasFailure |= runStep("rewrite-manifests",
+          () => rewriteManifests(spark, catalogName, table))
+
+        LOG.info(s"=== Maintenance end: `$catalogName`.$table ===")
+      }
+    } finally {
+      spark.stop()
+    }
+
+    if (hasFailure) {
+      LOG.error("Some maintenance steps failed — check logs above for details.")
+      sys.exit(1)
+    }
+    LOG.info("All maintenance steps completed successfully.")
+  }
+
+  private def runStep(stepName: String, step: () => Unit): Boolean = {
+    try {
+      LOG.info(s"[$stepName] starting")
+      step()
+      LOG.info(s"[$stepName] completed")
+      false
+    } catch {
+      case e: Exception =>
+        LOG.error(s"[$stepName] failed: ${e.getMessage}", e)
+        true
+    }
+  }
+
+  private def setTableProperties(spark: SparkSession,
+                                 catalogName: String,
+                                 table: String): Unit = {
+    spark.sql(
+      s"""ALTER TABLE `$catalogName`.$table SET TBLPROPERTIES (
+         |  'write.parquet.compression-codec' = 'zstd',
+         |  'write.metadata.delete-after-commit.enabled' = 'true',
+         |  'write.metadata.previous-versions-max' = '100'
+         |)""".stripMargin)
+  }
+
+  private def rewriteDataFiles(spark: SparkSession,
+                               catalogName: String,
+                               table: String,
+                               targetFileSize: Long,
+                               minFileSize: Long,
+                               maxConcurrentRewrites: Int,
+                               maxFileGroupSize: Long,
+                               partialProgressMaxCommits: Int): Unit = {
+    LOG.info(s"  binpack: target=${targetFileSize}B, min=${minFileSize}B, " +
+      s"maxConcurrent=$maxConcurrentRewrites, " +
+      s"maxFileGroupSize=${maxFileGroupSize}B, " +
+      s"partialProgressMaxCommits=$partialProgressMaxCommits")
+    val df = spark.sql(
+      s"""CALL `$catalogName`.system.rewrite_data_files(
+         |  table => '$table',
+         |  strategy => 'binpack',
+         |  options => map(
+         |    'target-file-size-bytes', '$targetFileSize',
+         |    'min-file-size-bytes', '$minFileSize',
+         |    'max-concurrent-file-group-rewrites', '$maxConcurrentRewrites',
+         |    'max-file-group-size-bytes', '$maxFileGroupSize',
+         |    'partial-progress.enabled', 'true',
+         |    'partial-progress.max-commits', '$partialProgressMaxCommits'
+         |  )
+         |)""".stripMargin)
+    df.collect().foreach(row => LOG.info(s"  result: $row"))
+  }
+
+  private def expireSnapshots(spark: SparkSession,
+                              catalogName: String,
+                              table: String,
+                              maxAgeHours: Int,
+                              retainLast: Int): Unit = {
+    val olderThan = TS_FMT.format(Instant.now().minus(maxAgeHours, ChronoUnit.HOURS))
+    LOG.info(s"  olderThan=$olderThan, retainLast=$retainLast")
+    val df = spark.sql(
+      s"""CALL `$catalogName`.system.expire_snapshots(
+         |  table => '$table',
+         |  older_than => TIMESTAMP '$olderThan',
+         |  retain_last => $retainLast
+         |)""".stripMargin)
+    df.collect().foreach(row => LOG.info(s"  result: $row"))
+  }
+
+  private def rewriteManifests(spark: SparkSession,
+                               catalogName: String,
+                               table: String): Unit = {
+    val df = spark.sql(
+      s"CALL `$catalogName`.system.rewrite_manifests(table => '$table')")
+    df.collect().foreach(row => LOG.info(s"  result: $row"))
+  }
+
+  private def parseArgs(args: Array[String]): Map[String, String] = {
+    val builder = Map.newBuilder[String, String]
+    var i = 0
+    while (i < args.length - 1) {
+      if (args(i).startsWith("--")) {
+        builder += (args(i).substring(2) -> args(i + 1))
+        i += 2
+      } else {
+        i += 1
+      }
+    }
+    builder.result()
+  }
+
+  private def require(params: Map[String, String], key: String): String =
+    params.getOrElse(key,
+      throw new IllegalArgumentException(s"Missing required parameter: --$key"))
+}
