@@ -1,0 +1,135 @@
+package com.maintenance.spark
+
+import org.apache.spark.sql.SparkSession
+import org.slf4j.{Logger, LoggerFactory}
+
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.time.{Instant, ZoneOffset}
+
+/**
+ * Iceberg 고아 파일(orphan file) 정리 배치 잡 (Spark 3.5.x / Iceberg 1.10.x, Scala 2.12).
+ *
+ * `IcebergMaintenanceJob` 와 분리된 이유:
+ *   - `remove_orphan_files` 는 테이블 위치 전체를 스캔 + 메타데이터와 대조 → 비용이 큼
+ *   - 기본 `older_than` 이 3일 → 시간당 스케줄과 맞지 않음
+ *   - in-flight 파일(아직 커밋되지 않은 쓰기) 을 지울 위험 → 스트리밍과 조율된 창에서만 실행
+ *   - 되돌릴 수 없는 destructive 연산 → compaction 잡과 blast radius 분리
+ *
+ * 운영 가이드:
+ *   - 최초 도입 시에는 `--orphan.dry-run=true` 로 먼저 대상 파일 목록만 확인
+ *   - `--orphan.older-than-hours` 는 가장 오래 걸리는 쓰기/체크포인트 + 여유 시간보다 커야 함
+ *
+ * 필수 파라미터:
+ *   --iceberg.catalog                       Iceberg catalog 이름 (예: hms)
+ *   --maintenance.tables                    대상 테이블 (쉼표 구분)
+ *
+ * 선택 파라미터 (기본값):
+ *   --orphan.older-than-hours               72        이보다 오래된 파일만 대상 (3일)
+ *   --orphan.dry-run                        false     true 면 삭제 없이 대상 파일만 나열
+ *   --orphan.max-concurrent-deletes         5         동시 삭제 요청 수
+ */
+object IcebergOrphanCleanupJob {
+
+  private val LOG: Logger = LoggerFactory.getLogger(getClass)
+
+  private val TS_FMT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC)
+
+  private val DefaultOlderThanHours: Int = 72
+  private val DefaultDryRun: Boolean = false
+  private val DefaultMaxConcurrentDeletes: Int = 5
+
+  def main(args: Array[String]): Unit = {
+    val params = parseArgs(args)
+
+    val catalogName = require(params, "iceberg.catalog")
+    val tables = require(params, "maintenance.tables")
+
+    val olderThanHours = params
+      .getOrElse("orphan.older-than-hours", DefaultOlderThanHours.toString)
+      .toInt
+    val dryRun = params
+      .getOrElse("orphan.dry-run", DefaultDryRun.toString)
+      .toBoolean
+    val maxConcurrentDeletes = params
+      .getOrElse("orphan.max-concurrent-deletes", DefaultMaxConcurrentDeletes.toString)
+      .toInt
+
+    val spark = SparkSession.builder().appName("iceberg-orphan-cleanup").getOrCreate()
+
+    var hasFailure = false
+    try {
+      tables.split(",").iterator.map(_.trim).filter(_.nonEmpty).foreach { table =>
+        LOG.info(s"=== Orphan cleanup start: `$catalogName`.$table " +
+          s"(dryRun=$dryRun, olderThanHours=$olderThanHours) ===")
+
+        hasFailure |= runStep("remove-orphan-files",
+          () => removeOrphanFiles(spark, catalogName, table,
+            olderThanHours, dryRun, maxConcurrentDeletes))
+
+        LOG.info(s"=== Orphan cleanup end: `$catalogName`.$table ===")
+      }
+    } finally {
+      spark.stop()
+    }
+
+    if (hasFailure) {
+      LOG.error("Some orphan cleanup steps failed — check logs above for details.")
+      sys.exit(1)
+    }
+    LOG.info("All orphan cleanup steps completed successfully.")
+  }
+
+  private def runStep(stepName: String, step: () => Unit): Boolean = {
+    try {
+      LOG.info(s"[$stepName] starting")
+      step()
+      LOG.info(s"[$stepName] completed")
+      false
+    } catch {
+      case e: Exception =>
+        LOG.error(s"[$stepName] failed: ${e.getMessage}", e)
+        true
+    }
+  }
+
+  private def removeOrphanFiles(spark: SparkSession,
+                                catalogName: String,
+                                table: String,
+                                olderThanHours: Int,
+                                dryRun: Boolean,
+                                maxConcurrentDeletes: Int): Unit = {
+    val olderThan = TS_FMT.format(Instant.now().minus(olderThanHours, ChronoUnit.HOURS))
+    LOG.info(s"  olderThan=$olderThan, dryRun=$dryRun, " +
+      s"maxConcurrentDeletes=$maxConcurrentDeletes")
+    val df = spark.sql(
+      s"""CALL `$catalogName`.system.remove_orphan_files(
+         |  table => '$table',
+         |  older_than => TIMESTAMP '$olderThan',
+         |  dry_run => $dryRun,
+         |  max_concurrent_deletes => $maxConcurrentDeletes
+         |)""".stripMargin)
+    val rows = df.collect()
+    LOG.info(s"  orphan files ${if (dryRun) "found (dry-run)" else "removed"}: ${rows.length}")
+    rows.foreach(row => LOG.info(s"  $row"))
+  }
+
+  private def parseArgs(args: Array[String]): Map[String, String] = {
+    val builder = Map.newBuilder[String, String]
+    var i = 0
+    while (i < args.length - 1) {
+      if (args(i).startsWith("--")) {
+        builder += (args(i).substring(2) -> args(i + 1))
+        i += 2
+      } else {
+        i += 1
+      }
+    }
+    builder.result()
+  }
+
+  private def require(params: Map[String, String], key: String): String =
+    params.getOrElse(key,
+      throw new IllegalArgumentException(s"Missing required parameter: --$key"))
+}
