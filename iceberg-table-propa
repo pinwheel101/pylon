@@ -1,0 +1,35 @@
+코드베이스에서 두 테이블(`fdc_summary` array, `fdc_summary_flat`)의 스키마, 적재 패턴(Flink 체크포인트마다 commit), 유지보수 잡(`scripts/iceberg_maintenance.py`, `IcebergMaintenanceJob.java`)을 확인했습니다. 이를 기반으로 Spark SQL로 테이블 만들 때 필요한 속성들을 정리합니다.
+
+---
+
+
+
+
+## 5. Spark SQL 템플릿
+
+```sql
+CREATE TABLE IF NOT EXISTS polaris.summary (
+  summaryDateTime TIMESTAMP,
+  sumsq_val ARRAY<DOUBLE>,
+  ingest_ts TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (days(summaryDateTime))
+TBLPROPERTIES (
+  'format-version' = '2',
+  'write.format.default' = 'parquet',
+  'write.parquet.compression-codec' = 'zstd',
+  'write.target-file-size-bytes' = '536870912',
+  'write.parquet.row-group-size-bytes' = '134217728',
+  'write.metadata.delete-after-commit.enabled' = 'true',
+  'write.metadata.previous-versions-max' = '100',
+  'commit.manifest.target-size-bytes' = '8388608',
+  'commit.manifest.min-count-to-merge' = '100',
+  'commit.manifest-merge.enabled' = 'true',
+  'history.expire.max-snapshot-age-ms' = '259200000',
+  'history.expire.min-snapshots-to-keep' = '100',
+  'commit.retry.num-retries' = '4',
+  'commit.retry.min-wait-ms' = '100',
+  'commit.retry.max-wait-ms' = '60000'
+);
+```
